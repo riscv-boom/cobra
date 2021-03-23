@@ -13,6 +13,92 @@ import boom.util.{BoomCoreStringPrefix}
 
 
 
+class GlobalHistory(implicit p: Parameters) extends BoomBundle()(p)
+  with HasBoomFrontendParameters
+{
+  // For the dual banked case, each bank ignores the contribution of the
+  // last bank to the history. Thus we have to track the most recent update to the
+  // history in that case
+  val old_history = UInt(globalHistoryLength.W)
+
+  val current_saw_branch_not_taken = Bool()
+
+  val new_saw_branch_not_taken = Bool()
+  val new_saw_branch_taken     = Bool()
+
+  val ras_idx = UInt(log2Ceil(nRasEntries).W)
+
+  def histories(bank: Int) = {
+    if (nBanks == 1) {
+      old_history
+    } else {
+      require(nBanks == 2)
+      if (bank == 0) {
+        old_history
+      } else {
+        Mux(new_saw_branch_taken                            , old_history << 1 | 1.U,
+        Mux(new_saw_branch_not_taken                        , old_history << 1,
+                                                              old_history))
+      }
+    }
+  }
+
+  def ===(other: GlobalHistory): Bool = {
+    ((old_history === other.old_history) &&
+     (new_saw_branch_not_taken === other.new_saw_branch_not_taken) &&
+     (new_saw_branch_taken === other.new_saw_branch_taken)
+    )
+  }
+  def =/=(other: GlobalHistory): Bool = !(this === other)
+
+  def update(branches: UInt, cfi_taken: Bool, cfi_is_br: Bool, cfi_idx: UInt,
+    cfi_valid: Bool, addr: UInt,
+    cfi_is_call: Bool, cfi_is_ret: Bool): GlobalHistory = {
+    val cfi_idx_fixed = cfi_idx(log2Ceil(fetchWidth)-1,0)
+    val cfi_idx_oh = UIntToOH(cfi_idx_fixed)
+    val new_history = Wire(new GlobalHistory)
+
+    val not_taken_branches = branches & Mux(cfi_valid,
+                                            MaskLower(cfi_idx_oh) & ~Mux(cfi_is_br && cfi_taken, cfi_idx_oh, 0.U(fetchWidth.W)),
+                                            ~(0.U(fetchWidth.W)))
+
+    if (nBanks == 1) {
+      // In the single bank case every bank sees the history including the previous bank
+      new_history := DontCare
+      new_history.current_saw_branch_not_taken := false.B
+      val saw_not_taken_branch = not_taken_branches =/= 0.U || current_saw_branch_not_taken
+      new_history.old_history := Mux(cfi_is_br && cfi_taken && cfi_valid   , histories(0) << 1 | 1.U,
+                                 Mux(saw_not_taken_branch                  , histories(0) << 1,
+                                                                             histories(0)))
+    } else {
+      // In the two bank case every bank ignore the history added by the previous bank
+      val base = histories(1)
+      val cfi_in_bank_0 = cfi_valid && cfi_taken && cfi_idx_fixed < bankWidth.U
+      val ignore_second_bank = cfi_in_bank_0 || mayNotBeDualBanked(addr)
+
+      val first_bank_saw_not_taken = not_taken_branches(bankWidth-1,0) =/= 0.U || current_saw_branch_not_taken
+      new_history.current_saw_branch_not_taken := false.B
+      when (ignore_second_bank) {
+        new_history.old_history := histories(1)
+        new_history.new_saw_branch_not_taken := first_bank_saw_not_taken
+        new_history.new_saw_branch_taken     := cfi_is_br && cfi_in_bank_0
+      } .otherwise {
+        new_history.old_history := Mux(cfi_is_br && cfi_in_bank_0                             , histories(1) << 1 | 1.U,
+                                   Mux(first_bank_saw_not_taken                               , histories(1) << 1,
+                                                                                                histories(1)))
+
+        new_history.new_saw_branch_not_taken := not_taken_branches(fetchWidth-1,bankWidth) =/= 0.U
+        new_history.new_saw_branch_taken     := cfi_valid && cfi_taken && cfi_is_br && !cfi_in_bank_0
+
+      }
+    }
+    new_history.ras_idx := Mux(cfi_valid && cfi_is_call, WrapInc(ras_idx, nRasEntries),
+                           Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, nRasEntries), ras_idx))
+    new_history
+  }
+
+}
+
 
 // A branch prediction for a single instruction
 class BranchPrediction(implicit p: Parameters) extends BoomBundle()(p)
